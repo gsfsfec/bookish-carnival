@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>球球大乱斗</title>
+    <script src="https://js.pusher.com/8.4.0/pusher.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'PingFang SC','Microsoft YaHei',sans-serif; background:#121212; color:#fff; overflow:hidden; }
+        
+        /* 大厅 */
+        #lobby { position: absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+                 background:#222; padding:30px; border-radius:20px; text-align:center; }
+        #lobby h1 { margin-bottom:20px; color:#fff; }
+        #lobby input, #lobby button { width:240px; padding:12px; margin:8px 0; border:none; border-radius:10px; }
+        #lobby input { background:#333; color:#fff; }
+        #lobby button { background:#4CAF50; color:#fff; font-weight:bold; }
+
+        /* 游戏界面 */
+        #game { display:none; width:100vw; height:100vh; position:relative; }
+        #gameCanvas { width:100%; height:100%; background:#121212; touch-action:none; }
+
+        /* 右侧排行榜 */
+        #rankPanel {
+            position:absolute; right:10px; top:10px; width:160px;
+            background:rgba(0,0,0,0.6); border-radius:10px; padding:10px;
+            max-height:85vh; overflow-y:auto;
+        }
+        .rank-item {
+            display:flex; align-items:center; gap:8px; padding:4px 0;
+            font-size:13px; white-space:nowrap;
+        }
+        .rank-avatar {
+            width:24px; height:24px; border-radius:50%; object-fit:cover;
+        }
+        .rank-name { flex:1; overflow:hidden; }
+        .rank-kill { color:#ff9800; }
+
+        /* 顶部信息 */
+        #topInfo {
+            position:absolute; top:10px; left:10px;
+            display:flex; gap:20px; font-size:16px; font-weight:bold;
+        }
+
+        /* 摇杆 */
+        .joystick {
+            position:absolute; bottom:30px; left:30px;
+            width:140px; height:140px; background:rgba(255,255,255,0.1);
+            border-radius:50%;
+        }
+        .joystick-knob {
+            position:absolute; top:50%; left:50%;
+            width:50px; height:50px; background:#fff; border-radius:50%;
+            transform:translate(-50%,-50%);
+        }
+    </style>
+</head>
+<body>
+
+<div id="lobby">
+    <h1>球球大乱斗</h1>
+    <input id="playerName" placeholder="输入名字" value="玩家">
+    <input id="avatarUrl" placeholder="头像URL（可选）" value="https://i.imgur.com/8OKZ76D.png">
+    <button id="createBtn">创建房间</button>
+    <input id="roomId" placeholder="房间号">
+    <button id="joinBtn">加入房间</button>
+</div>
+
+<div id="game">
+    <div id="topInfo">
+        <div>重量: <span id="weightText">0</span></div>
+        <div>血量: <span id="hpText">0</span></div>
+        <div>击杀: <span id="killText">0</span></div>
+    </div>
+
+    <div id="rankPanel"></div>
+    <canvas id="gameCanvas"></canvas>
+    <div class="joystick"><div class="joystick-knob"></div></div>
+</div>
+
+<script>
+const PUSHER_KEY = '34b4edd6678d7440e600';
+const PUSHER_CLUSTER = 'ap3';
+const MAP_SIZE = 3000;
+const BASE_SPEED = 5;
+
+// 画布高清
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+function resizeCanvas(){
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = window.innerWidth * dpr;
+    canvas.height = window.innerHeight * dpr;
+    canvas.style.width = window.innerWidth+'px';
+    canvas.style.height = window.innerHeight+'px';
+    ctx.scale(dpr,dpr);
+}
+resizeCanvas();
+window.addEventListener('resize',resizeCanvas);
+
+// 全局
+let pusher, channel;
+let playerId;
+let players = {};
+let foods = [];
+let cameraX=0, cameraY=0;
+let moveX=0, moveY=0;
+let gameOver = false;
+
+// 头像缓存
+const avatarCache = {};
+function loadImg(url,cb){
+    if(avatarCache[url]) return cb(avatarCache[url]);
+    const img = new Image();
+    img.crossOrigin='anonymous';
+    img.onload=()=>{ avatarCache[url]=img; cb(img); }
+    img.src=url;
+}
+
+// 随机
+function rndPos(){
+    return {
+        x: 50 + Math.random()*(MAP_SIZE-100),
+        y: 50 + Math.random()*(MAP_SIZE-100)
+    };
+}
+function rndColor(){
+    return `hsl(${Math.random()*360},70%,60%)`;
+}
+
+// 食物
+function initFood(){
+    foods=[];
+    for(let i=0;i<150;i++){
+        foods.push({...rndPos(), radius:5, color:rndColor()});
+    }
+}
+
+// 相机
+function updateCamera(){
+    const me = players[playerId];
+    if(!me) return;
+    const zoom = Math.max(0.5, 1 - (me.radius-15)/120);
+    ctx.setTransform(zoom,0,0,zoom,0,0);
+    cameraX = (canvas.width/2 / zoom) - me.x;
+    cameraY = (canvas.height/2 / zoom) - me.y;
+}
+
+// 绘制
+function draw(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.strokeStyle='#333'; ctx.lineWidth=4;
+    ctx.strokeRect(cameraX, cameraY, MAP_SIZE, MAP_SIZE);
+
+    // 食物
+    foods.forEach(f=>{
+        ctx.beginPath();
+        ctx.arc(f.x+cameraX, f.y+cameraY, f.radius,0,Math.PI*2);
+        ctx.fillStyle=f.color;
+        ctx.fill();
+    });
+
+    // 玩家
+    for(const id in players){
+        const p=players[id];
+        if(!p.alive) continue;
+        const x=p.x+cameraX, y=p.y+cameraY;
+
+        // 球
+        const g = ctx.createRadialGradient(x,y,0,x,y,p.radius);
+        g.addColorStop(0,p.color);
+        g.addColorStop(1,p.color+'66');
+        ctx.beginPath();
+        ctx.arc(x,y,p.radius,0,Math.PI*2);
+        ctx.fillStyle=g;
+        ctx.fill();
+        ctx.strokeStyle='rgba(255,255,255,0.3)';
+        ctx.lineWidth=2;
+        ctx.stroke();
+
+        // 头像
+        if(p.avatar){
+            loadImg(p.avatar,img=>{
+                ctx.save();
+                ctx.beginPath();
+                ctx.arc(x,y,p.radius*0.8,0,Math.PI*2);
+                ctx.clip();
+                ctx.drawImage(img, x-p.radius*0.8, y-p.radius*0.8, p.radius*1.6,p.radius*1.6);
+                ctx.restore();
+            });
+        }
+
+        // 名字 + 重量 + 血量
+        const name = p.name;
+        const weightText = `${p.weight}`;
+        const hpText = `(${p.hp}/3)`;
+        const fullText = `${name} ${weightText} ${hpText}`;
+
+        const textWidth = ctx.measureText(fullText).width;
+        const bgWidth = Math.max(80, textWidth + 16);
+
+        // 背景
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(x - bgWidth/2, y - p.radius - 40, bgWidth, 32);
+
+        // 文字
+        ctx.fillStyle = '#fff';
+        ctx.font = '13px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(fullText, x, y - p.radius - 20);
+    }
+}
+
+// 碰撞
+function dist(a,b){
+    const dx=a.x-b.x, dy=a.y-b.y;
+    return Math.hypot(dx,dy);
+}
+
+// 逻辑
+function logic(){
+    const me=players[playerId];
+    if(!me || !me.alive || gameOver) return;
+
+    // 速度随重量变慢
+    const speed = Math.max(2.5, BASE_SPEED - me.weight/12);
+
+    if(moveX || moveY){
+        const m=Math.hypot(moveX,moveY);
+        me.x += moveX/m * speed;
+        me.y += moveY/m * speed;
+        me.x = Math.max(me.radius, Math.min(MAP_SIZE-me.radius, me.x));
+        me.y = Math.max(me.radius, Math.min(MAP_SIZE-me.radius, me.y));
+    }
+
+    // 吃食物
+    for(let i=foods.length-1;i>=0;i--){
+        const f=foods[i];
+        if(dist(me,f)<me.radius+5){
+            foods.splice(i,1);
+            foods.push({...rndPos(),radius:5,color:rndColor()});
+            me.weight += 1;
+            me.radius = 15 + me.weight/2;
+            updateInfo();
+        }
+    }
+
+    // 玩家碰撞
+    for(const id in players){
+        if(id===playerId) continue;
+        const p=players[id];
+        if(!p.alive) continue;
+        const d=dist(me,p);
+        if(d < me.radius + p.radius){
+            // 重量高的碰低的
+            if(me.weight > p.weight){
+                // 扣对方血
+                p.hp -= 1;
+                channel.trigger('client-damage',{id:id, hp:p.hp});
+                // 被撞3次死亡
+                if(p.hp <=0){
+                    p.alive=false;
+                    me.kill +=1;
+                    updateInfo();
+                    channel.trigger('client-death',{victim:id,killer:playerId});
+                }
+            }
+        }
+    }
+}
+
+// 信息
+function updateInfo(){
+    const me=players[playerId];
+    if(!me) return;
+    document.getElementById('weightText').textContent=Math.round(me.weight);
+    document.getElementById('hpText').textContent=me.hp;
+    document.getElementById('killText').textContent=me.kill;
+}
+
+// 排行榜
+function updateRank(){
+    const panel=document.getElementById('rankPanel');
+    const list = Object.values(players)
+        .filter(p=>p.alive)
+        .sort((a,b)=>b.kill - a.kill);
+    panel.innerHTML='';
+    list.forEach((p,i)=>{
+        const div=document.createElement('div');
+        div.className='rank-item';
+        div.innerHTML=`
+            <img class="rank-avatar" src="${p.avatar||''}">
+            <div class="rank-name">${p.name}</div>
+            <div class="rank-kill">${p.kill}</div>
+        `;
+        panel.appendChild(div);
+    });
+}
+
+// 循环
+function loop(){
+    logic();
+    updateCamera();
+    draw();
+    updateRank();
+    if(!gameOver) requestAnimationFrame(loop);
+}
+
+// 摇杆
+const j=document.querySelector('.joystick');
+const knob=document.querySelector('.joystick-knob');
+j.addEventListener('touchstart',e=>{
+    e.preventDefault();
+    const r=j.getBoundingClientRect();
+    const x=e.touches[0].clientX - r.left -70;
+    const y=e.touches[0].clientY - r.top -70;
+    const m=Math.hypot(x,y);
+    const max=50;
+    moveX = m>max ? x/m*max : x;
+    moveY = m>max ? y/m*max : y;
+    knob.style.transform=`translate(${moveX}px,${moveY}px)`;
+});
+document.addEventListener('touchmove',e=>{
+    e.preventDefault();
+    const r=j.getBoundingClientRect();
+    const x=e.touches[0].clientX - r.left -70;
+    const y=e.touches[0].clientY - r.top -70;
+    const m=Math.hypot(x,y);
+    const max=50;
+    moveX = m>max ? x/m*max : x;
+    moveY = m>max ? y/m*max : y;
+    knob.style.transform=`translate(${moveX}px,${moveY}px)`;
+});
+document.addEventListener('touchend',()=>{
+    moveX=0; moveY=0;
+    knob.style.transform='translate(-50%,-50%)';
+});
+
+// Pusher
+function initPusher(){
+    pusher = new Pusher(PUSHER_KEY,{cluster:PUSHER_CLUSTER});
+}
+
+// 创建
+document.getElementById('createBtn').onclick=()=>{
+    const name=document.getElementById('playerName').value.trim()||'玩家';
+    const avatar=document.getElementById('avatarUrl').value.trim();
+    initPusher();
+    const room='fight-'+Math.random().toString(36).slice(2,8).toUpperCase();
+    playerId='p-'+Math.random().toString(36).slice(2);
+    channel=pusher.subscribe(room);
+    channel.bind('pusher:subscription_succeeded',()=>{
+        players[playerId]={
+            x:MAP_SIZE/2, y:MAP_SIZE/2,
+            radius:15, weight:0, hp:3, kill:0,
+            color:rndColor(), name, avatar, alive:true
+        };
+        initFood();
+        document.getElementById('lobby').style.display='none';
+        document.getElementById('game').style.display='block';
+        updateInfo();
+        loop();
+        channel.trigger('client-join',players[playerId]);
+    });
+    bindEvents();
+};
+
+// 加入
+document.getElementById('joinBtn').onclick=()=>{
+    const name=document.getElementById('playerName').value.trim()||'玩家';
+    const avatar=document.getElementById('avatarUrl').value.trim();
+    const room=document.getElementById('roomId').value.trim();
+    if(!room) return alert('输入房间号');
+    initPusher();
+    playerId='p-'+Math.random().toString(36).slice(2);
+    channel=pusher.subscribe(room);
+    channel.bind('pusher:subscription_succeeded',()=>{
+        players[playerId]={
+            x:MAP_SIZE/2+100, y:MAP_SIZE/2,
+            radius:15, weight:0, hp:3, kill:0,
+            color:rndColor(), name, avatar, alive:true
+        };
+        initFood();
+        document.getElementById('lobby').style.display='none';
+        document.getElementById('game').style.display='block';
+        updateInfo();
+        loop();
+        channel.trigger('client-join',players[playerId]);
+    });
+    bindEvents();
+};
+
+function bindEvents(){
+    channel.bind('client-join',data=>{
+        players[data.id]=data;
+    });
+    channel.bind('client-move',data=>{
+        if(players[data.id]){
+            players[data.id].x=data.x;
+            players[data.id].y=data.y;
+            players[data.id].radius=data.radius;
+            players[data.id].weight=data.weight;
+        }
+    });
+    channel.bind('client-damage',data=>{
+        if(players[data.id]) players[data.id].hp=data.hp;
+    });
+    channel.bind('client-death',data=>{
+        if(players[data.victim]) players[data.victim].alive=false;
+        if(players[data.killer]) players[data.killer].kill +=1;
+    });
+    setInterval(()=>{
+        const me=players[playerId];
+        if(me && me.alive) channel.trigger('client-move',{
+            id:playerId, x:me.x, y:me.y,
+            radius:me.radius, weight:me.weight
+        });
+    },60);
+}
+</script>
+</body>
+</html>
